@@ -1,0 +1,84 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-stress-test-config
+  labels:
+    app: redis-fatigue
+data:
+  config.yaml: |-
+    redis:
+      addr: "127.0.0.1:6379"
+      password: ""
+      db: 0
+      tls: false
+    
+    test:
+      threads: 4              # 并发线程数
+      loops: 10                # 总轮次，每轮都会重新统计并打印结果
+      ops_per_thread: 100000    # 每个线程每轮执行的操作次数
+      key_space: 0        # 键空间大小，随机键会落在 [0, key_space)
+      value_size: 128         # 字符串写入的value大小(字节)
+      expire_seconds: 300     # 所有写入的过期时间(秒)
+      pipeline: 0             # 写入时批量大小，>1时启用TxPipeline
+      use_tx: false            # 写入使用TxPipeline(事务管道)以保证写与过期原子性
+      hash_field_count: 5     # HSET时写入的字段个数
+      operation_mix:
+        get: 40
+        set: 40
+        hget: 10
+        hset: 10
+        hmset: 1
+        hgetall: 1
+    
+    i18n:
+      round_finished: "第 %d 轮完成，用时 %v\n"
+      total_line: "总操作: %d，成功: %d，失败: %d，成功率: %.2f%%\n"
+      qps_line: "QPS: %.2f\n"
+      latency_line: "延迟 平均:%v P50:%v P95:%v P99:%v\n"
+      all_finished: "所有轮次完成"
+      total_summary: "总操作: %d，成功: %d，失败: %d，成功率: %.2f%%\n"
+      overall_line: "总耗时: %v，总体QPS: %.2f\n"
+    
+    output:
+      csv_file: "results_zh.csv"
+      csv_headers: ["时间","轮次","用时(毫秒)","总操作","成功","失败","成功率(%)","QPS","平均延迟(微秒)","P50(微秒)","P95(微秒)","P99(微秒)"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-fatigue
+  labels:
+    app: redis-fatigue
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-fatigue
+  template:
+    metadata:
+      labels:
+        app: redis-fatigue
+    spec:
+      restartPolicy: Always
+      containers:
+        - name: redis-fatigue
+          image: redis-fatigue:latest
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "64Mi"
+            limits:
+              cpu: "1"
+              memory: "128Mi"
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+      volumes:
+        - name: config
+          configMap:
+            name: redis-stress-test-config
