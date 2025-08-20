@@ -7,25 +7,31 @@ redis:
   tls: false
 
 test:
-  threads: 4              # 并发线程数
+  threads: 20              # 并发线程数
   loops: 10                # 总轮次，每轮都会重新统计并打印结果
-  ops_per_thread: 1000    # 每个线程每轮执行的操作次数
+  ops_per_thread: 100000    # 每个线程每轮执行的操作次数
   key_space: 10000        # 键空间大小，随机键会落在 [0, key_space)
-  value_size: 128         # 字符串写入的value大小(字节)
+  string_value_size: 128  # 字符串写入的value大小(字节)
+  hash_value_size: 128    # 哈希写入的value大小(字节)
+  list_value_size: 128    # 列表写入的value大小(字节)
   expire_seconds: 300     # 所有写入的过期时间(秒)
-  pipeline: 1             # 写入时批量大小，>1时启用TxPipeline
-  use_tx: true            # 写入使用TxPipeline(事务管道)以保证写与过期原子性
+  pipeline: 0             # 写入时批量大小，>1时启用TxPipeline
+  use_tx: false            # 写入使用TxPipeline(事务管道)以保证写与过期原子性
   hash_field_count: 5     # HSET时写入的字段个数
+  slow_threshold_ms: 1000 # 慢操作阈值(毫秒)，超过此时间的操作会被记录和统计 
   # 操作权重，权重为0则不执行该操作
-  # 支持: get, set, hget, hset, hmset, hgetall
+  # 支持: get, set, hget, hset, hmset, hgetall, lpush, lpop, llen
   operation_mix:
-    get: 40
-    set: 40
-    hget: 10
-    hset: 10
-    hmset: 0
-    hgetall: 0
-
+    get: 100
+    set: 100
+    hget: 20
+    hset: 20
+    hmset: 1
+    hgetall: 1
+    lpush: 5
+    lpop: 5
+    llen: 2
+    
 i18n:
   round_finished: "第 %d 轮完成，用时 %v\n"
   total_line: "总操作: %d，成功: %d，失败: %d，成功率: %.2f%%\n"
@@ -35,6 +41,8 @@ i18n:
   total_summary: "总操作: %d，成功: %d，失败: %d，成功率: %.2f%%\n"
   overall_line: "总耗时: %v，总体QPS: %.2f\n"
 
+# 输出设置
 output:
   csv_file: "results_zh.csv"
+  verbose_logging: true  # 是否打印每个命令的详细执行情况
   csv_headers: ["时间","轮次","用时(毫秒)","总操作","成功","失败","成功率(%)","QPS","平均延迟(微秒)","P50(微秒)","P95(微秒)","P99(微秒)"]

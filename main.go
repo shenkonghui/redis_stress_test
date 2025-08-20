@@ -35,6 +35,7 @@ func defaultCSVHeaders() []string {
 		"fail",
 		"success_rate",
 		"qps",
+		"slow_ops",
 		"latency_avg_us",
 		"p50_us",
 		"p95_us",
@@ -106,6 +107,7 @@ func writeRoundCSV(cfg *Config, loop int, elapsed time.Duration, st stats) error
 		fmt.Sprintf("%d", fail),
 		fmt.Sprintf("%.2f", successRate),
 		fmt.Sprintf("%.2f", qps),
+		fmt.Sprintf("%d", st.SlowOps),
 		fmt.Sprintf("%d", avgDur.Microseconds()),
 		fmt.Sprintf("%d", p50.Microseconds()),
 		fmt.Sprintf("%d", p95.Microseconds()),
@@ -126,19 +128,25 @@ type OperationMix struct {
 	HSet    int `yaml:"hset"`
 	HMSet   int `yaml:"hmset"`
 	HGetAll int `yaml:"hgetall"`
+	LPush   int `yaml:"lpush"`
+	LPop    int `yaml:"lpop"`
+	LLen    int `yaml:"llen"`
 }
 
 type TestConfig struct {
-	Threads        int          `yaml:"threads"`
-	Loops          int          `yaml:"loops"`
-	OpsPerThread   int          `yaml:"ops_per_thread"`
-	KeySpace       int          `yaml:"key_space"`
-	ValueSize      int          `yaml:"value_size"`
-	ExpireSeconds  int          `yaml:"expire_seconds"`
-	Pipeline       int          `yaml:"pipeline"`
-	UseTx          bool         `yaml:"use_tx"`
-	HashFieldCount int          `yaml:"hash_field_count"`
-	OperationMix   OperationMix `yaml:"operation_mix"`
+	Threads         int          `yaml:"threads"`
+	Loops           int          `yaml:"loops"`
+	OpsPerThread    int          `yaml:"ops_per_thread"`
+	KeySpace        int          `yaml:"key_space"`
+	StringValueSize int          `yaml:"string_value_size"`
+	HashValueSize   int          `yaml:"hash_value_size"`
+	ListValueSize   int          `yaml:"list_value_size"`
+	ExpireSeconds   int          `yaml:"expire_seconds"`
+	Pipeline        int          `yaml:"pipeline"`
+	UseTx           bool         `yaml:"use_tx"`
+	HashFieldCount  int          `yaml:"hash_field_count"`
+	SlowThresholdMs int          `yaml:"slow_threshold_ms"`
+	OperationMix    OperationMix `yaml:"operation_mix"`
 }
 
 type I18nConfig struct {
@@ -152,8 +160,9 @@ type I18nConfig struct {
 }
 
 type OutputConfig struct {
-	CSVFile    string   `yaml:"csv_file"`
-	CSVHeaders []string `yaml:"csv_headers"`
+	CSVFile        string   `yaml:"csv_file"`
+	CSVHeaders     []string `yaml:"csv_headers"`
+	VerboseLogging bool     `yaml:"verbose_logging"`
 }
 
 type Config struct {
@@ -169,6 +178,9 @@ type redisClient interface {
 	HGet(ctx context.Context, key, field string) *redis.StringCmd
 	HSet(ctx context.Context, key string, values ...interface{}) *redis.IntCmd
 	HGetAll(ctx context.Context, key string) *redis.MapStringStringCmd
+	LPush(ctx context.Context, key string, values ...interface{}) *redis.IntCmd
+	LPop(ctx context.Context, key string) *redis.StringCmd
+	LLen(ctx context.Context, key string) *redis.IntCmd
 	Expire(ctx context.Context, key string, expiration time.Duration) *redis.BoolCmd
 	Pipeline() redis.Pipeliner
 	TxPipeline() redis.Pipeliner
@@ -184,6 +196,9 @@ const (
 	opHSet
 	opHMSet
 	opHGetAll
+	opLPush
+	opLPop
+	opLLen
 )
 
 func (o opType) String() string {
@@ -200,6 +215,12 @@ func (o opType) String() string {
 		return "HMSET"
 	case opHGetAll:
 		return "HGETALL"
+	case opLPush:
+		return "LPUSH"
+	case opLPop:
+		return "LPOP"
+	case opLLen:
+		return "LLEN"
 	default:
 		return "UNKNOWN"
 	}
@@ -209,14 +230,25 @@ type stats struct {
 	Ops       int
 	Success   int
 	Fail      int
+	SlowOps   int             // 慢操作次数
 	Durations []time.Duration // per-op approx latency
+	// 每种命令类型的执行次数统计
+	CmdCounts map[opType]int
 }
 
 func (s *stats) merge(other stats) {
 	s.Ops += other.Ops
 	s.Success += other.Success
 	s.Fail += other.Fail
+	s.SlowOps += other.SlowOps
 	s.Durations = append(s.Durations, other.Durations...)
+	// 合并命令计数统计
+	if s.CmdCounts == nil {
+		s.CmdCounts = make(map[opType]int)
+	}
+	for cmd, count := range other.CmdCounts {
+		s.CmdCounts[cmd] += count
+	}
 }
 
 func percentile(durs []time.Duration, p float64) time.Duration {
@@ -292,6 +324,9 @@ func newWeightedPicker(m OperationMix) *weightedPicker {
 	add(opHSet, m.HSet)
 	add(opHMSet, m.HMSet)
 	add(opHGetAll, m.HGetAll)
+	add(opLPush, m.LPush)
+	add(opLPop, m.LPop)
+	add(opLLen, m.LLen)
 	if wp.total == 0 {
 		// default
 		add(opGet, 50)
@@ -346,6 +381,7 @@ func worker(ctx context.Context, id int, client redisClient, cfg *Config, loopId
 	opsTarget := cfg.Test.OpsPerThread
 
 	var st stats
+	st.CmdCounts = make(map[opType]int)
 	st.Ops = opsTarget
 
 	expire := time.Duration(cfg.Test.ExpireSeconds) * time.Second
@@ -372,6 +408,9 @@ func worker(ctx context.Context, id int, client redisClient, cfg *Config, loopId
 			pipe = client.Pipeline()
 		}
 
+		// collect commands when not using pipeline, so we can evaluate errors uniformly
+		cmdsLocal := make([]redis.Cmder, 0, len(batch)*2)
+
 		// enqueue
 		for _, op := range batch {
 			switch op.op {
@@ -379,27 +418,30 @@ func worker(ctx context.Context, id int, client redisClient, cfg *Config, loopId
 				if pipe != nil {
 					pipe.Get(ctx, op.key)
 				} else {
-					client.Get(ctx, op.key)
+					cmd := client.Get(ctx, op.key)
+					cmdsLocal = append(cmdsLocal, cmd)
 				}
 			case opSet:
-				val := makeValue(r, cfg.Test.ValueSize)
+				val := makeValue(r, cfg.Test.StringValueSize)
 				if pipe != nil {
 					pipe.Set(ctx, op.key, val, expire)
 				} else {
-					client.Set(ctx, op.key, val, expire)
+					cmd := client.Set(ctx, op.key, val, expire)
+					cmdsLocal = append(cmdsLocal, cmd)
 				}
 			case opHGet:
 				if pipe != nil {
 					pipe.HGet(ctx, op.key, op.field)
 				} else {
-					client.HGet(ctx, op.key, op.field)
+					cmd := client.HGet(ctx, op.key, op.field)
+					cmdsLocal = append(cmdsLocal, cmd)
 				}
 			case opHSet:
 				// HSET multi fields then optional EXPIRE (2 commands when expire > 0)
 				pairs := make([]interface{}, 0, cfg.Test.HashFieldCount*2)
 				for i := 0; i < cfg.Test.HashFieldCount; i++ {
 					pairs = append(pairs, fmt.Sprintf("f%d", i))
-					pairs = append(pairs, makeValue(r, cfg.Test.ValueSize))
+					pairs = append(pairs, makeValue(r, cfg.Test.HashValueSize))
 				}
 				if pipe != nil {
 					pipe.HSet(ctx, op.key, pairs...)
@@ -407,9 +449,11 @@ func worker(ctx context.Context, id int, client redisClient, cfg *Config, loopId
 						pipe.Expire(ctx, op.key, expire)
 					}
 				} else {
-					client.HSet(ctx, op.key, pairs...)
+					cmd := client.HSet(ctx, op.key, pairs...)
+					cmdsLocal = append(cmdsLocal, cmd)
 					if expire > 0 {
-						client.Expire(ctx, op.key, expire)
+						cmd2 := client.Expire(ctx, op.key, expire)
+						cmdsLocal = append(cmdsLocal, cmd2)
 					}
 				}
 			case opHMSet:
@@ -417,7 +461,7 @@ func worker(ctx context.Context, id int, client redisClient, cfg *Config, loopId
 				pairs := make([]interface{}, 0, cfg.Test.HashFieldCount*2)
 				for i := 0; i < cfg.Test.HashFieldCount; i++ {
 					pairs = append(pairs, fmt.Sprintf("f%d", i))
-					pairs = append(pairs, makeValue(r, cfg.Test.ValueSize))
+					pairs = append(pairs, makeValue(r, cfg.Test.HashValueSize))
 				}
 				if pipe != nil {
 					pipe.HSet(ctx, op.key, pairs...)
@@ -425,16 +469,48 @@ func worker(ctx context.Context, id int, client redisClient, cfg *Config, loopId
 						pipe.Expire(ctx, op.key, expire)
 					}
 				} else {
-					client.HSet(ctx, op.key, pairs...)
+					cmd := client.HSet(ctx, op.key, pairs...)
+					cmdsLocal = append(cmdsLocal, cmd)
 					if expire > 0 {
-						client.Expire(ctx, op.key, expire)
+						cmd2 := client.Expire(ctx, op.key, expire)
+						cmdsLocal = append(cmdsLocal, cmd2)
 					}
 				}
 			case opHGetAll:
 				if pipe != nil {
 					pipe.HGetAll(ctx, op.key)
 				} else {
-					client.HGetAll(ctx, op.key)
+					cmd := client.HGetAll(ctx, op.key)
+					cmdsLocal = append(cmdsLocal, cmd)
+				}
+			case opLPush:
+				val := makeValue(r, cfg.Test.ListValueSize)
+				if pipe != nil {
+					pipe.LPush(ctx, op.key, val)
+					if expire > 0 {
+						pipe.Expire(ctx, op.key, expire)
+					}
+				} else {
+					cmd := client.LPush(ctx, op.key, val)
+					cmdsLocal = append(cmdsLocal, cmd)
+					if expire > 0 {
+						cmd2 := client.Expire(ctx, op.key, expire)
+						cmdsLocal = append(cmdsLocal, cmd2)
+					}
+				}
+			case opLPop:
+				if pipe != nil {
+					pipe.LPop(ctx, op.key)
+				} else {
+					cmd := client.LPop(ctx, op.key)
+					cmdsLocal = append(cmdsLocal, cmd)
+				}
+			case opLLen:
+				if pipe != nil {
+					pipe.LLen(ctx, op.key)
+				} else {
+					cmd := client.LLen(ctx, op.key)
+					cmdsLocal = append(cmdsLocal, cmd)
 				}
 			}
 		}
@@ -444,72 +520,120 @@ func worker(ctx context.Context, id int, client redisClient, cfg *Config, loopId
 		if pipe != nil {
 			cmds, err = pipe.Exec(ctx)
 		} else {
-			// not pipelined
+			cmds = cmdsLocal
 		}
 
 		batchDur := time.Since(start)
 
-		if pipe != nil {
-			// Determine per-op success when pipelined
-			idx := 0
-			for _, op := range batch {
-				expect := 1
-				if (op.op == opHSet || op.op == opHMSet) && expire > 0 {
-					expect = 2
+		// 检测慢操作
+		slowThreshold := time.Duration(cfg.Test.SlowThresholdMs) * time.Millisecond
+		perOpDur := batchDur / time.Duration(len(batch))
+		isSlowBatch := batchDur >= slowThreshold
+
+		// Determine per-op success and print failures
+		idx := 0
+		for _, op := range batch {
+			expect := 1
+			if (op.op == opHSet || op.op == opHMSet || op.op == opLPush) && expire > 0 {
+				expect = 2
+			}
+			ok := true
+			for i := 0; i < expect; i++ {
+				if idx >= len(cmds) {
+					ok = false
+					break
 				}
-				ok := true
-				for i := 0; i < expect; i++ {
-					if idx >= len(cmds) {
-						ok = false
-						break
-					}
-					c := cmds[idx]
-					thisOK := false
-					if c != nil {
-						e := c.Err()
-						// For read operations, treat redis.Nil (key not found) as success
-						if op.op == opGet || op.op == opHGet || op.op == opHGetAll {
-							if e == nil || e == redis.Nil {
-								thisOK = true
-							}
-						} else {
-							if e == nil {
-								thisOK = true
-							}
+				c := cmds[idx]
+				thisOK := false
+				var e error
+				if c != nil {
+					e = c.Err()
+					// For read operations, treat redis.Nil (key not found) as success
+					if op.op == opGet || op.op == opHGet || op.op == opHGetAll || op.op == opLPop || op.op == opLLen {
+						if e == nil || e == redis.Nil {
+							thisOK = true
+						}
+					} else {
+						if e == nil {
+							thisOK = true
 						}
 					}
-					if !thisOK {
-						ok = false
+				}
+				if !thisOK {
+					ok = false
+					// log failure details
+					sub := ""
+					switch op.op {
+					case opGet:
+						sub = "GET"
+					case opSet:
+						sub = "SET"
+					case opHGet:
+						sub = "HGET"
+					case opHSet:
+						if i == 0 {
+							sub = "HSET"
+						} else {
+							sub = "EXPIRE"
+						}
+					case opHMSet:
+						if i == 0 {
+							sub = "HMSET"
+						} else {
+							sub = "EXPIRE"
+						}
+					case opHGetAll:
+						sub = "HGETALL"
+					case opLPush:
+						if i == 0 {
+							sub = "LPUSH"
+						} else {
+							sub = "EXPIRE"
+						}
+					case opLPop:
+						sub = "LPOP"
+					case opLLen:
+						sub = "LLEN"
 					}
-					idx++
+					if cfg.Output.VerboseLogging {
+						log.Printf("Operation failed: op=%s key=%s field=%s sub=%s err=%v", op.op.String(), op.key, op.field, sub, e)
+					}
 				}
-				if ok {
-					st.Success++
-				} else {
-					st.Fail++
-				}
-				// approximate latency split
-				st.Durations = append(st.Durations, batchDur/time.Duration(len(batch)))
+				idx++
 			}
-			// top-level err indicates transaction/pipeline failure
-			if err != nil {
-				// already accounted per-command above
-			}
-		} else {
-			// Non-pipelined: each op executed immediately above; best-effort accounting
-			for range batch {
+			if ok {
 				st.Success++
-				st.Durations = append(st.Durations, batchDur/time.Duration(len(batch)))
+				// 检测并统计慢操作
+				if isSlowBatch {
+					st.SlowOps++
+					log.Printf("Slow operation detected: op=%s key=%s field=%s duration=%v (threshold=%v)",
+						op.op.String(), op.key, op.field, perOpDur, slowThreshold)
+				}
+			} else {
+				st.Fail++
+				// 失败的操作也可能是慢操作
+				if isSlowBatch {
+					st.SlowOps++
+					log.Printf("Slow operation detected (failed): op=%s key=%s field=%s duration=%v (threshold=%v)",
+						op.op.String(), op.key, op.field, perOpDur, slowThreshold)
+				}
 			}
+			// approximate latency split
+			st.Durations = append(st.Durations, batchDur/time.Duration(len(batch)))
+		}
+		// top-level err indicates transaction/pipeline failure
+		if err != nil {
+			log.Printf("Pipeline execution error: %v", err)
 		}
 
 		batch = batch[:0]
 	}
 
 	// Build batch items
+	ks := max(1, cfg.Test.KeySpace)
 	for done := 0; done < opsTarget; {
 		op := wp.pick(r)
-		keyIdx := r.Intn(cfg.Test.KeySpace)
+		keyIdx := r.Intn(ks)
 		var key, field string
 		switch op {
 		case opGet, opSet:
@@ -519,6 +643,8 @@ func worker(ctx context.Context, id int, client redisClient, cfg *Config, loopId
 			if op == opHGet {
 				field = fmt.Sprintf("f%d", r.Intn(max(1, cfg.Test.HashFieldCount)))
 			}
+		case opLPush, opLPop, opLLen:
+			key = "list:" + fmt.Sprintf("%d", keyIdx)
 		}
 		batch = append(batch, logicalOp{op: op, key: key, field: field})
 		done++
@@ -545,6 +671,7 @@ func strOrDefault(s, def string) string {
 	return s
 }
 
+// printRound 打印单轮测试结果
 func printRound(cfg *Config, loop int, elapsed time.Duration, st stats) {
 	fmt.Println(strings.Repeat("=", 64))
 	fmt.Printf(strOrDefault(cfg.I18n.RoundFinished, "Round %d finished in %v\n"), loop+1, elapsed)
@@ -552,17 +679,37 @@ func printRound(cfg *Config, loop int, elapsed time.Duration, st stats) {
 		st.Ops, st.Success, st.Fail, 100*float64(st.Success)/float64(max(1, st.Ops)))
 	qps := float64(st.Ops) / elapsed.Seconds()
 	fmt.Printf(strOrDefault(cfg.I18n.QPSLine, "QPS: %.2f\n"), qps)
+
+	var avg time.Duration
 	if len(st.Durations) > 0 {
 		sort.Slice(st.Durations, func(i, j int) bool { return st.Durations[i] < st.Durations[j] })
 		var sum time.Duration
 		for _, d := range st.Durations {
 			sum += d
 		}
-		avg := time.Duration(int64(sum) / int64(len(st.Durations)))
+		avg = time.Duration(int64(sum) / int64(len(st.Durations)))
 		p50 := percentile(st.Durations, 0.50)
 		p95 := percentile(st.Durations, 0.95)
 		p99 := percentile(st.Durations, 0.99)
 		fmt.Printf(strOrDefault(cfg.I18n.LatencyLine, "Latency avg:%v p50:%v p95:%v p99:%v\n"), avg, p50, p95, p99)
+	}
+
+	// 打印慢操作统计
+	if st.SlowOps > 0 {
+		fmt.Printf("慢操作统计: %d 次操作超过 %dms 阈值\n", st.SlowOps, cfg.Test.SlowThresholdMs)
+	}
+
+	// 如果启用了详细日志，打印命令执行统计汇总
+	if cfg.Output.VerboseLogging {
+		fmt.Println(strings.Repeat("-", 40))
+		fmt.Printf("第 %d 轮命令执行统计汇总:\n", loop+1)
+		fmt.Printf("  总命令数: %d\n", st.Ops)
+		fmt.Printf("  成功命令: %d\n", st.Success)
+		fmt.Printf("  失败命令: %d\n", st.Fail)
+		fmt.Printf("  慢操作数: %d\n", st.SlowOps)
+		fmt.Printf("  成功率: %.2f%%\n", 100*float64(st.Success)/float64(max(1, st.Ops)))
+		fmt.Printf("  平均延迟: %v\n", avg)
+		fmt.Println(strings.Repeat("-", 40))
 	}
 }
 
@@ -620,6 +767,11 @@ func main() {
 	fmt.Printf(strOrDefault(cfg.I18n.TotalSummary, "Total Ops: %d, Success: %d, Fail: %d, SuccessRate: %.2f%%\n"),
 		grand.Ops, grand.Success, grand.Fail, 100*float64(grand.Success)/float64(max(1, grand.Ops)))
 	fmt.Printf(strOrDefault(cfg.I18n.OverallLine, "Total Time: %v, Overall QPS: %.2f\n"), allElapsed, float64(grand.Ops)/allElapsed.Seconds())
+	// 打印总慢操作统计
+	if grand.SlowOps > 0 {
+		fmt.Printf("总慢操作统计: %d 次操作超过 %dms 阈值 (占比: %.2f%%)\n",
+			grand.SlowOps, cfg.Test.SlowThresholdMs, 100*float64(grand.SlowOps)/float64(max(1, grand.Ops)))
+	}
 	if len(grand.Durations) > 0 {
 		sort.Slice(grand.Durations, func(i, j int) bool { return grand.Durations[i] < grand.Durations[j] })
 		var sum time.Duration
